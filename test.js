@@ -67,7 +67,8 @@ class SystemTest {
       { name: 'Reply Approval and Posting', test: () => this.testReplyApprovalAndPosting() },
       { name: 'Engagement AI Provider Wiring', test: () => this.testEngagementAIProviderWiring() },
       { name: 'Engagement Sync Schedule', test: () => this.testEngagementSyncSchedule() },
-      { name: 'Growth Experiment Refresh Schedule', test: () => this.testGrowthExperimentRefreshSchedule() }
+      { name: 'Growth Experiment Refresh Schedule', test: () => this.testGrowthExperimentRefreshSchedule() },
+      { name: 'Cron Scheduler Compatibility', test: () => this.testCronSchedulerCompatibility() }
     ];
 
     let passed = 0;
@@ -1610,6 +1611,7 @@ class SystemTest {
     const { ProvenanceService } = require('./utils/provenance-service');
     const { OperatorService } = require('./utils/operator-service');
     const { PublishingSchedulingAgent } = require('./agents/publishing-scheduling-agent');
+    const { runFFmpeg } = require('./utils/ffmpeg');
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'yaa-provenance-'));
     const db = new Database();
     db.dbPath = path.join(directory, 'provenance.db');
@@ -1617,7 +1619,10 @@ class SystemTest {
     const productionId = 'prod-provenance-test';
     const videoPath = path.join(directory, 'video.mp4');
     const audioPath = path.join(directory, 'narration.mp3');
-    await fs.writeFile(videoPath, Buffer.from('test-video'));
+    await runFFmpeg([
+      '-y', '-f', 'lavfi', '-i', 'color=c=black:s=32x32:r=10:d=1',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', videoPath
+    ]);
     await fs.writeFile(audioPath, Buffer.from('test-audio'));
 
     try {
@@ -1655,6 +1660,7 @@ class SystemTest {
         },
         assets: { finalVideo: { path: videoPath, simulated: false }, audio: { path: audioPath, status: 'ready', simulated: false, provider: 'fixture-tts' } }
       };
+      await db.saveProductionData(production);
       await db.saveProductionSnapshot(production);
 
       const provenanceService = new ProvenanceService(db);
@@ -1665,6 +1671,12 @@ class SystemTest {
       ) {
         throw new Error('Generated research sources and claims were not initialized as unresolved provenance');
       }
+      await db.saveContentReview(productionId, {
+        status: 'approved',
+        editorData: {},
+        qualityChecks: [],
+        reviewedAt: new Date().toISOString()
+      });
 
       const publishGuard = new PublishingSchedulingAgent(db, {});
       publishGuard.publishQueue = [{ productionId, status: 'scheduled', metadata: {} }];
@@ -1708,10 +1720,12 @@ class SystemTest {
         videos: { insert: async request => { uploadRequest = request; return { data: { id: 'provenance-video' } }; } }
       };
       await publishing.uploadToYouTube({
+        productionId,
         publishTime: new Date(Date.now() + 86400000).toISOString(),
         metadata: {
           seo: production.seo,
           video: { path: videoPath },
+          audio: production.assets.audio,
           privacyStatus: 'private',
           containsSyntheticMedia: true
         }
@@ -1969,7 +1983,7 @@ class SystemTest {
 
     // Discussion #74: sharp 0.33's wasm32 build crashes with @emnapi/runtime >= 1.4
     // (Termux and other platforms without a native binary).
-    const [major, minor] = require('sharp/package.json').version.split('.').map(Number);
+    const [major, minor] = sharp.versions.sharp.split('.').map(Number);
     if (major === 0 && minor < 34) {
       throw new Error(`sharp ${major}.${minor} cannot load its wasm32 build with current @emnapi/runtime`);
     }
@@ -2163,6 +2177,16 @@ class SystemTest {
         await server.start();
         if (listenArgs?.host !== '127.0.0.1') throw new Error(`Dashboard server bound to ${listenArgs?.host} instead of loopback by default`);
         process.env.HOST = '0.0.0.0';
+        let networkStartRejected = false;
+        try {
+          await server.start();
+        } catch (error) {
+          networkStartRejected = /API_KEY/.test(error.message);
+        }
+        if (!networkStartRejected || listenArgs?.host !== '127.0.0.1') {
+          throw new Error('Dashboard server listened on a network interface without an API_KEY');
+        }
+        process.env.API_KEY = 'network-binding-test-key';
         await server.start();
         if (listenArgs?.host !== '0.0.0.0') throw new Error('HOST did not override the dashboard bind address');
       } finally {
@@ -2452,33 +2476,143 @@ class SystemTest {
     }
 
     const previousKey = process.env.API_KEY;
-    process.env.API_KEY = 'test-secret';
-    const middleware = agent.requireAPIKey();
+    const previousHost = process.env.HOST;
+    let server;
+    const testKey = 'phase-two-test-api-key';
+    try {
+      process.env.API_KEY = testKey;
+      process.env.HOST = '127.0.0.1';
 
-    let rejectedNextCalled = false;
-    const rejectedResponse = this.createMockResponse();
-    middleware({ get: () => 'wrong-secret' }, rejectedResponse, () => {
-      rejectedNextCalled = true;
-    });
+      const middleware = agent.requireAPIKey();
+      let rejectedNextCalled = false;
+      const rejectedResponse = this.createMockResponse();
+      middleware({ get: () => 'wrong-secret' }, rejectedResponse, () => {
+        rejectedNextCalled = true;
+      });
+      if (rejectedNextCalled || rejectedResponse.statusCode !== 401) {
+        throw new Error('Invalid API key was not rejected');
+      }
 
-    if (rejectedNextCalled || rejectedResponse.statusCode !== 401) {
-      throw new Error('Invalid API key was not rejected');
-    }
+      let acceptedNextCalled = false;
+      const acceptedResponse = this.createMockResponse();
+      middleware({ get: () => testKey }, acceptedResponse, () => {
+        acceptedNextCalled = true;
+      });
+      if (!acceptedNextCalled || acceptedResponse.statusCode) {
+        throw new Error('Valid API key was not accepted');
+      }
 
-    let acceptedNextCalled = false;
-    const acceptedResponse = this.createMockResponse();
-    middleware({ get: () => 'test-secret' }, acceptedResponse, () => {
-      acceptedNextCalled = true;
-    });
+      process.env.API_KEY = '';
+      process.env.HOST = '0.0.0.0';
+      let networkNextCalled = false;
+      const networkResponse = this.createMockResponse();
+      agent.requireAPIKey()({ get: () => undefined }, networkResponse, () => {
+        networkNextCalled = true;
+      });
+      if (networkNextCalled || networkResponse.statusCode !== 401) {
+        throw new Error('Missing API key was accepted for a network host');
+      }
 
-    if (!acceptedNextCalled || acceptedResponse.statusCode) {
-      throw new Error('Valid API key was not accepted');
-    }
+      let rejectedNetworkStart = false;
+      try {
+        agent.assertNetworkAuthenticationConfigured('0.0.0.0', '');
+      } catch {
+        rejectedNetworkStart = true;
+      }
+      if (!rejectedNetworkStart) {
+        throw new Error('Server startup accepted a non-loopback host without API_KEY');
+      }
+      agent.assertNetworkAuthenticationConfigured('127.0.0.1', '');
 
-    if (previousKey === undefined) {
-      delete process.env.API_KEY;
-    } else {
-      process.env.API_KEY = previousKey;
+      process.env.API_KEY = testKey;
+      process.env.HOST = '127.0.0.1';
+      agent.setupAPI();
+      server = await new Promise(resolve => {
+        const running = agent.app.listen(0, '127.0.0.1', () => resolve(running));
+      });
+      const baseURL = `http://127.0.0.1:${server.address().port}`;
+      const authHeaders = { 'x-api-key': testKey };
+
+      const unauthenticatedRead = await fetch(`${baseURL}/api/readiness`);
+      const unauthenticatedCaseVariant = await fetch(`${baseURL}/API/readiness`);
+      const unauthenticatedAsset = await fetch(`${baseURL}/api/content/item/asset/script`);
+      const unauthenticatedLegacyRead = await fetch(`${baseURL}/ANALYTICS`);
+      const unauthenticatedSchedule = await fetch(`${baseURL}/SCHEDULE`);
+      const unauthenticatedMutation = await fetch(`${baseURL}/api/readiness/run`, { method: 'POST' });
+      if ([
+        unauthenticatedRead,
+        unauthenticatedCaseVariant,
+        unauthenticatedAsset,
+        unauthenticatedLegacyRead,
+        unauthenticatedSchedule,
+        unauthenticatedMutation
+      ].some(response => response.status !== 401)) {
+        throw new Error('An unauthenticated API read, asset, or mutation request was accepted');
+      }
+
+      const invalidKeyResponse = await fetch(`${baseURL}/api/readiness`, {
+        headers: { 'x-api-key': 'wrong-secret' }
+      });
+      const invalidKeyBody = await invalidKeyResponse.text();
+      if (invalidKeyResponse.status !== 401 || invalidKeyBody.includes('wrong-secret')) {
+        throw new Error('Invalid API key handling did not fail closed without echoing the key');
+      }
+
+      const authenticatedRead = await fetch(`${baseURL}/api/readiness`, { headers: authHeaders });
+      if (authenticatedRead.status !== 503 || authenticatedRead.headers.get('cache-control') !== 'no-store') {
+        throw new Error('Authenticated API request or private-response cache policy failed');
+      }
+      for (const header of ['content-security-policy', 'x-content-type-options', 'x-frame-options', 'referrer-policy']) {
+        if (!authenticatedRead.headers.get(header)) throw new Error(`Missing security response header: ${header}`);
+      }
+      if (authenticatedRead.headers.has('x-powered-by')) {
+        throw new Error('Express framework identification header was not disabled');
+      }
+
+      const crossOriginMutation = await fetch(`${baseURL}/api/readiness/run`, {
+        method: 'POST',
+        headers: { ...authHeaders, Origin: 'https://untrusted.example' },
+        body: '{}'
+      });
+      if (crossOriginMutation.status !== 403) {
+        throw new Error('Cross-origin mutation was not rejected');
+      }
+      const crossSiteWithoutOrigin = await fetch(`${baseURL}/api/readiness/run`, {
+        method: 'POST',
+        headers: { ...authHeaders, 'Sec-Fetch-Site': 'cross-site' },
+        body: '{}'
+      });
+      if (crossSiteWithoutOrigin.status !== 403) {
+        throw new Error('Cross-site mutation without an Origin header was not rejected');
+      }
+
+      const oversizedBody = await fetch(`${baseURL}/api/readiness/run`, {
+        method: 'POST',
+        headers: { ...authHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: 'x'.repeat(1024 * 1024) })
+      });
+      if (oversizedBody.status !== 413) {
+        throw new Error('Oversized JSON request was not rejected');
+      }
+
+      agent.apiRateLimits.clear();
+      let lastMutationResponse;
+      for (let request = 0; request < 31; request += 1) {
+        lastMutationResponse = await fetch(`${baseURL}/api/readiness/run`, {
+          method: 'POST',
+          headers: { ...authHeaders, 'Content-Type': 'application/json' },
+          body: '{}'
+        });
+      }
+      if (lastMutationResponse.status !== 429 || !lastMutationResponse.headers.get('retry-after')) {
+        throw new Error('API mutation rate limit was not enforced');
+      }
+    } finally {
+      if (server) await new Promise(resolve => server.close(resolve));
+      if (previousKey === undefined) delete process.env.API_KEY;
+      else process.env.API_KEY = previousKey;
+      if (previousHost === undefined) delete process.env.HOST;
+      else process.env.HOST = previousHost;
     }
 
     this.logger.info('API validation and security test completed successfully');
@@ -2501,18 +2635,34 @@ class SystemTest {
 
   async testPublishingSafety() {
     const { PublishingSchedulingAgent } = require('./agents/publishing-scheduling-agent');
+    const fs = require('fs').promises;
+    const os = require('os');
+    const { runFFmpeg } = require('./utils/ffmpeg');
+    const originalMP4Validator = PublishingSchedulingAgent.prototype.validateMP4Container;
+    PublishingSchedulingAgent.prototype.validateMP4Container = async () => {};
     const intentionalAudio = {
       intentionalSilence: true,
       silenceReason: 'This test fixture is intentionally silent.',
       silenceConfirmedAt: new Date().toISOString()
     };
     const agent = new PublishingSchedulingAgent({
-      updateScheduleEntry: async () => {}
+      updateScheduleEntry: async () => {},
+      getLatestReadinessRun: async () => null,
+      getProductionBundle: async id => ({
+        id,
+        review_status: 'approved',
+        provenance: { status: 'not_required' },
+        assets: {
+          finalVideo: { path: `${id}.mp4`, simulated: false },
+          audio: intentionalAudio
+        }
+      }),
+      getShortClip: async () => null
     }, {});
 
     agent.publishQueue = [
-      { productionId: 'prod-a', title: 'A', status: 'scheduled', metadata: { audio: intentionalAudio } },
-      { productionId: 'prod-b', title: 'B', status: 'scheduled', metadata: { audio: intentionalAudio } }
+      { productionId: 'prod-a', title: 'A', status: 'scheduled', metadata: { audio: intentionalAudio, video: { path: 'fixture-a.mp4', simulated: false } } },
+      { productionId: 'prod-b', title: 'B', status: 'scheduled', metadata: { audio: intentionalAudio, video: { path: 'fixture-b.mp4', simulated: false } } }
     ];
     agent.uploadToYouTube = async () => ({ id: 'youtube-1' });
 
@@ -2522,8 +2672,206 @@ class SystemTest {
       throw new Error('publishContent removed the wrong publish queue entries');
     }
 
-    const missingNarration = new PublishingSchedulingAgent({ updateScheduleEntry: async () => {} }, {});
-    missingNarration.publishQueue = [{ productionId: 'prod-no-audio', status: 'scheduled', metadata: {} }];
+    for (const reviewStatus of ['needs_review', 'needs_attention', 'rejected', 'draft']) {
+      const rejected = new PublishingSchedulingAgent({
+        updateScheduleEntry: async () => {},
+        getLatestReadinessRun: async () => null,
+        getProductionBundle: async id => ({
+          id,
+          review_status: reviewStatus,
+          provenance: { status: 'not_required' },
+          assets: {
+            finalVideo: { path: 'fixture.mp4', simulated: false },
+            audio: intentionalAudio
+          }
+        }),
+        getShortClip: async () => null
+      }, {});
+      rejected.publishQueue = [{
+        productionId: `prod-${reviewStatus}`,
+        status: 'scheduled',
+        metadata: { audio: intentionalAudio, video: { path: 'fixture.mp4', simulated: false } }
+      }];
+      rejected.uploadToYouTube = async () => { throw new Error('Upload must not start for unapproved content'); };
+      let blocked = false;
+      try {
+        await rejected.publishContent(`prod-${reviewStatus}`);
+      } catch (error) {
+        blocked = error.code === 'APPROVAL_REQUIRED';
+      }
+      if (!blocked) throw new Error(`Publishing accepted review status: ${reviewStatus}`);
+    }
+
+      const readinessBlocked = new PublishingSchedulingAgent({
+        updateScheduleEntry: async () => {},
+        getLatestReadinessRun: async () => ({
+          status: 'failed',
+          checks: [{ id: 'youtube_access', blocking: true, status: 'failed' }]
+        }),
+        getProductionBundle: async id => ({
+          id,
+          review_status: 'approved',
+          provenance: { status: 'not_required' },
+          assets: { finalVideo: { path: 'fixture.mp4', simulated: false }, audio: intentionalAudio }
+        }),
+        getShortClip: async () => null
+      }, {});
+      readinessBlocked.publishQueue = [{
+        productionId: 'prod-readiness',
+        status: 'scheduled',
+        metadata: { audio: intentionalAudio, video: { path: 'fixture.mp4', simulated: false } }
+      }];
+      let uploadStartedDuringReadinessFailure = false;
+      readinessBlocked.uploadToYouTube = async () => { uploadStartedDuringReadinessFailure = true; };
+      let readinessFailureRejected = false;
+      try {
+        await readinessBlocked.publishContent('prod-readiness');
+      } catch (error) {
+        readinessFailureRejected = error.code === 'READINESS_BLOCKED';
+      }
+      if (!readinessFailureRejected || uploadStartedDuringReadinessFailure) {
+        throw new Error('Publishing bypassed the failed production-readiness gate');
+      }
+
+      const simulatedVideo = new PublishingSchedulingAgent({
+        updateScheduleEntry: async () => {},
+        getLatestReadinessRun: async () => null,
+        getProductionBundle: async id => ({
+          id,
+          review_status: 'approved',
+          provenance: { status: 'not_required' },
+          assets: { finalVideo: { path: 'fixture.mp4', simulated: true }, audio: intentionalAudio }
+        }),
+        getShortClip: async () => null
+      }, {});
+      simulatedVideo.publishQueue = [{
+        productionId: 'prod-simulated',
+        status: 'scheduled',
+        metadata: { audio: intentionalAudio, video: { path: 'fixture.mp4', simulated: true } }
+      }];
+      let simulatedUploadStarted = false;
+      simulatedVideo.uploadToYouTube = async () => { simulatedUploadStarted = true; };
+      let simulatedVideoRejected = false;
+      try {
+        await simulatedVideo.publishContent('prod-simulated');
+      } catch (error) {
+        simulatedVideoRejected = error.code === 'REAL_MP4_REQUIRED';
+      }
+      if (!simulatedVideoRejected || simulatedUploadStarted) {
+        throw new Error('Publishing bypassed the real-MP4 safety guard');
+      }
+
+      const emergencyRejected = new PublishingSchedulingAgent({
+        updateScheduleEntry: async () => {},
+        getLatestReadinessRun: async () => null,
+        getProductionBundle: async id => ({
+          id,
+          review_status: 'needs_review',
+          provenance: { status: 'not_required' },
+          assets: { finalVideo: { path: 'fixture.mp4', simulated: false }, audio: intentionalAudio }
+        }),
+        getShortClip: async () => null
+      }, {});
+      emergencyRejected.publishQueue = [{
+        productionId: 'prod-emergency-rejected',
+        status: 'scheduled',
+        metadata: { audio: intentionalAudio, video: { path: 'fixture.mp4', simulated: false } }
+      }];
+      emergencyRejected.uploadToYouTube = async () => { throw new Error('Emergency upload must not start'); };
+      let emergencyBlocked = false;
+      try {
+        await emergencyRejected.emergencyPublish('prod-emergency-rejected');
+      } catch (error) {
+        emergencyBlocked = error.code === 'APPROVAL_REQUIRED';
+      }
+      if (!emergencyBlocked) throw new Error('Emergency publishing bypassed the approval guard');
+
+    const rejectedShort = new PublishingSchedulingAgent({
+      updateScheduleEntry: async () => {},
+      getLatestReadinessRun: async () => null,
+      getProductionBundle: async id => ({
+        id,
+        review_status: 'approved',
+        provenance: { status: 'not_required' },
+        assets: { finalVideo: { path: 'fixture.mp4', simulated: false }, audio: intentionalAudio }
+      }),
+      getShortClip: async id => ({
+        id,
+        productionId: 'prod-approved-source',
+        status: 'rendered',
+        approvedAt: null
+      })
+    }, {});
+    rejectedShort.publishQueue = [{
+      id: 'schedule-short-rendered',
+      productionId: 'short-rendered',
+      status: 'scheduled',
+      metadata: { shortClipId: 'short-rendered', sourceProductionId: 'prod-approved-source', audio: intentionalAudio, video: { path: 'fixture.mp4', simulated: false } }
+    }];
+    rejectedShort.uploadToYouTube = async () => { throw new Error('Upload must not start for an unapproved Short'); };
+    let shortBlocked = false;
+    try {
+      await rejectedShort.publishContent('short-rendered');
+    } catch (error) {
+      shortBlocked = error.code === 'APPROVAL_REQUIRED';
+    }
+    if (!shortBlocked) throw new Error('Publishing accepted an unapproved rendered Short');
+
+    for (const sourceStatus of ['needs_review', 'needs_attention', 'rejected', 'missing']) {
+      const sourceRejectedShort = new PublishingSchedulingAgent({
+        updateScheduleEntry: async () => {},
+        getLatestReadinessRun: async () => null,
+        getProductionBundle: async id => sourceStatus === 'missing'
+          ? null
+          : {
+            id,
+            review_status: sourceStatus,
+            provenance: { status: 'not_required' },
+            assets: { finalVideo: { path: 'fixture.mp4', simulated: false }, audio: intentionalAudio }
+          },
+        getShortClip: async id => ({
+          id,
+          productionId: `prod-source-${sourceStatus}`,
+          status: 'scheduled',
+          approvedAt: new Date().toISOString()
+        })
+      }, {});
+      sourceRejectedShort.publishQueue = [{
+        id: `schedule-short-${sourceStatus}`,
+        productionId: `short-${sourceStatus}`,
+        status: 'scheduled',
+        metadata: {
+          shortClipId: `short-${sourceStatus}`,
+          sourceProductionId: `prod-source-${sourceStatus}`,
+          audio: intentionalAudio,
+          video: { path: 'fixture.mp4', simulated: false }
+        }
+      }];
+      let sourceBlocked = false;
+      sourceRejectedShort.uploadToYouTube = async () => { throw new Error('Upload must not start for a Short with unapproved source content'); };
+      try {
+        await sourceRejectedShort.publishContent(`short-${sourceStatus}`);
+      } catch (error) {
+        sourceBlocked = error.code === 'SHORT_SOURCE_APPROVAL_REQUIRED';
+      }
+      if (!sourceBlocked) throw new Error(`Short publishing accepted source status: ${sourceStatus}`);
+    }
+
+    const missingNarration = new PublishingSchedulingAgent({
+      updateScheduleEntry: async () => {},
+      getLatestReadinessRun: async () => null,
+      getProductionBundle: async id => ({
+        id,
+        review_status: 'approved',
+        provenance: { status: 'not_required' },
+        assets: {
+          finalVideo: { path: 'fixture.mp4', simulated: false },
+          audio: null
+        }
+      }),
+      getShortClip: async () => null
+    }, {});
+    missingNarration.publishQueue = [{ productionId: 'prod-no-audio', status: 'scheduled', metadata: { video: { path: 'fixture.mp4', simulated: false } } }];
     missingNarration.uploadToYouTube = async () => { throw new Error('Upload must not start without narration'); };
     let narrationPublishBlocked = false;
     try {
@@ -2532,6 +2880,38 @@ class SystemTest {
       narrationPublishBlocked = error.code === 'NARRATION_REQUIRED';
     }
     if (!narrationPublishBlocked) throw new Error('Publishing accepted a production without narration evidence');
+
+    const mediaDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'yaa-publishing-mp4-'));
+    const validMP4 = path.join(mediaDirectory, 'valid.mp4');
+    const invalidMP4 = path.join(mediaDirectory, 'invalid.mp4');
+    try {
+      await runFFmpeg([
+        '-y', '-f', 'lavfi', '-i', 'color=c=black:s=32x32:r=10:d=1',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', validMP4
+      ]);
+      await fs.writeFile(invalidMP4, Buffer.from('not an mp4 container'));
+
+      const containerValidator = new PublishingSchedulingAgent({ updateScheduleEntry: async () => {} }, {});
+      await originalMP4Validator.call(containerValidator, validMP4);
+
+      let invalidRejected = false;
+      try {
+        await originalMP4Validator.call(containerValidator, invalidMP4);
+      } catch (error) {
+        invalidRejected = error.code === 'REAL_MP4_REQUIRED';
+      }
+      if (!invalidRejected) throw new Error('An invalid .mp4 container passed publishing validation');
+
+      let missingRejected = false;
+      try {
+        await originalMP4Validator.call(containerValidator, path.join(mediaDirectory, 'missing.mp4'));
+      } catch (error) {
+        missingRejected = error.code === 'REAL_MP4_REQUIRED';
+      }
+      if (!missingRejected) throw new Error('A missing MP4 passed publishing validation');
+    } finally {
+      await fs.rm(mediaDirectory, { recursive: true, force: true });
+    }
 
     let missingFileRejected = false;
     try {
@@ -2546,10 +2926,18 @@ class SystemTest {
 
     let uncertainUpdates = [];
     const uncertain = new PublishingSchedulingAgent({
-      updateScheduleEntry: async entry => uncertainUpdates.push({ ...entry })
+      updateScheduleEntry: async entry => uncertainUpdates.push({ ...entry }),
+      getLatestReadinessRun: async () => null,
+      getProductionBundle: async id => ({
+        id,
+        review_status: 'approved',
+        provenance: { status: 'not_required' },
+        assets: { finalVideo: { path: 'fixture.mp4', simulated: false }, audio: intentionalAudio }
+      }),
+      getShortClip: async () => null
     }, {});
     uncertain.publishQueue = [
-      { id: 'schedule-uncertain', productionId: 'prod-uncertain', title: 'Uncertain', status: 'scheduled', metadata: { audio: intentionalAudio } }
+      { id: 'schedule-uncertain', productionId: 'prod-uncertain', title: 'Uncertain', status: 'scheduled', metadata: { audio: intentionalAudio, video: { path: 'fixture.mp4', simulated: false } } }
     ];
     let uploadAttempts = 0;
     uncertain.uploadToYouTube = async entry => {
@@ -2577,11 +2965,20 @@ class SystemTest {
     let reconciliationCalls = 0;
     const recorded = {
       id: 'schedule-recorded', productionId: 'prod-recorded', title: 'Recorded', status: 'uploaded',
-      youtubeId: 'youtube-existing', metadata: { audio: intentionalAudio }
+      youtubeId: 'youtube-existing',
+      metadata: { audio: intentionalAudio, video: { path: 'fixture.mp4', simulated: false } }
     };
     const reconcile = new PublishingSchedulingAgent({
       getLatestScheduleEntry: async () => recorded,
-      updateScheduleEntry: async () => {}
+      updateScheduleEntry: async () => {},
+      getLatestReadinessRun: async () => null,
+      getProductionBundle: async id => ({
+        id,
+        review_status: 'approved',
+        provenance: { status: 'not_required' },
+        assets: { finalVideo: { path: 'fixture.mp4', simulated: false }, audio: intentionalAudio }
+      }),
+      getShortClip: async () => null
     }, {});
     reconcile.youtube = {
       videos: {
@@ -2602,11 +2999,20 @@ class SystemTest {
     let deletedScheduleId = null;
     const scheduleActions = new PublishingSchedulingAgent({
       updateScheduleEntry: async () => {},
-      deleteScheduleEntry: async id => { deletedScheduleId = id; }
+      deleteScheduleEntry: async id => { deletedScheduleId = id; },
+      getLatestReadinessRun: async () => null,
+      getProductionBundle: async id => ({
+        id,
+        review_status: 'approved',
+        provenance: { status: 'not_required' },
+        assets: { finalVideo: { path: 'fixture.mp4', simulated: false }, audio: intentionalAudio }
+      }),
+      getShortClip: async () => null
     }, {});
     scheduleActions.publishQueue = [{
       id: 'schedule-actions', productionId: 'prod-actions', title: 'Actions', status: 'scheduled',
-      publishTime: new Date(Date.now() + 3600000).toISOString(), metadata: { audio: intentionalAudio }
+      publishTime: new Date(Date.now() + 3600000).toISOString(),
+      metadata: { audio: intentionalAudio, video: { path: 'fixture.mp4', simulated: false } }
     }];
     const future = new Date(Date.now() + 7200000).toISOString();
     const rescheduled = await scheduleActions.rescheduleContent('prod-actions', future);
@@ -2619,7 +3025,17 @@ class SystemTest {
     }
 
     let uploadMetadata = null;
-    const immediate = new PublishingSchedulingAgent({ updateScheduleEntry: async () => {} }, {});
+    const immediate = new PublishingSchedulingAgent({
+      updateScheduleEntry: async () => {},
+      getLatestReadinessRun: async () => null,
+      getProductionBundle: async id => ({
+        id,
+        review_status: 'approved',
+        provenance: { status: 'not_required' },
+        assets: { finalVideo: { path: 'fixture.mp4', simulated: false }, audio: intentionalAudio }
+      }),
+      getShortClip: async () => null
+    }, {});
     immediate.youtube = {
       videos: { insert: async request => { uploadMetadata = request.requestBody; return { data: { id: 'youtube-now' } }; } },
       thumbnails: { set: async () => {} }, captions: { insert: async () => {} }
@@ -2627,12 +3043,19 @@ class SystemTest {
     immediate.getVideoStream = async () => ({ fixture: true });
     await immediate.uploadToYouTube({
       id: 'schedule-now', publishTime: new Date().toISOString(),
-      metadata: { seo: { title: 'Publish now', description: 'Immediate upload.', tags: ['test'] }, video: { path: 'fixture.mp4' }, privacyStatus: 'public' }
+      productionId: 'prod-now',
+      metadata: {
+        seo: { title: 'Publish now', description: 'Immediate upload.', tags: ['test'] },
+        video: { path: 'fixture.mp4', simulated: false },
+        audio: intentionalAudio,
+        privacyStatus: 'public'
+      }
     }, { publishNow: true });
     if (uploadMetadata?.status?.privacyStatus !== 'public' || uploadMetadata?.status?.publishAt !== undefined) {
       throw new Error('Publish now still sent a stale scheduled publishAt value');
     }
 
+    PublishingSchedulingAgent.prototype.validateMP4Container = originalMP4Validator;
     this.logger.info('Publishing safety test completed successfully');
   }
 
@@ -2838,7 +3261,13 @@ class SystemTest {
   async testPlaceholderSchedulingGuard() {
     const { PublishingSchedulingAgent } = require('./agents/publishing-scheduling-agent');
     const agent = new PublishingSchedulingAgent({
-      saveScheduleEntry: async () => {}
+      saveScheduleEntry: async () => {},
+      getProductionBundle: async id => ({
+        id,
+        review_status: 'approved',
+        provenance: { status: 'not_required' }
+      }),
+      getShortClip: async () => null
     }, {});
 
     const simulated = await agent.scheduleContent({
@@ -3883,6 +4312,37 @@ class SystemTest {
     }
     const noService = new DailyAutomation({}, {}, {});
     await noService.refreshGrowthExperiments();
+  }
+
+  async testCronSchedulerCompatibility() {
+    const cron = require('node-cron');
+    const originalCreateTask = cron.createTask;
+    const createdTasks = [];
+    cron.createTask = (expression, callback, options) => {
+      const task = {
+        expression,
+        callback,
+        options,
+        startCalls: 0,
+        start() { this.startCalls += 1; },
+        stop() {}
+      };
+      createdTasks.push(task);
+      return task;
+    };
+
+    try {
+      const scheduler = new DailyAutomation({}, {});
+      await scheduler.setupScheduledTasks();
+      if (createdTasks.length !== 8 || createdTasks.some(task => task.startCalls !== 1)) {
+        throw new Error('All eight cron tasks must be created stopped and started exactly once');
+      }
+      if (createdTasks.some(task => task.options?.scheduled !== undefined)) {
+        throw new Error('Removed node-cron v3 scheduled option is still being used');
+      }
+    } finally {
+      cron.createTask = originalCreateTask;
+    }
   }
 }
 

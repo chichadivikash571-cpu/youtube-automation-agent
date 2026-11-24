@@ -293,6 +293,7 @@ class ShortsRepurposingService {
         captions: clip.captionsPath ? { path: clip.captionsPath } : null,
         thumbnail: null
       },
+      explicitApproval: true,
       scheduledPublishTime: publishTime.toISOString(),
       priority: 60,
       privacyStatus,

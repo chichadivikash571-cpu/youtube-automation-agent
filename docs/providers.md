@@ -61,7 +61,7 @@ CHANNEL_NAME=Your Channel Name
 DEFAULT_PRIVACY_STATUS=private
 ```
 
-The dashboard listens on `127.0.0.1` by default. If you set `HOST=0.0.0.0` to reach it from other devices, also set `API_KEY`, which every request that changes something must then send in the `x-api-key` header.
+The dashboard listens on `127.0.0.1` by default. If you set `HOST` to a non-loopback address such as `0.0.0.0`, `API_KEY` is mandatory or the server will refuse to start. When configured, the key is required for all API requests (including reads) in the `x-api-key` header. Keyless development remains available on loopback.
 
 ## Adding a provider
 

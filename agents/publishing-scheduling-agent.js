@@ -4,6 +4,7 @@ const fsSync = require('fs');
 const path = require('path');
 const { Logger } = require('../utils/logger');
 const { assertValidYouTubeMetadata } = require('../utils/youtube-metadata-validator');
+const { runFFmpeg } = require('../utils/ffmpeg');
 
 class PublishingSchedulingAgent {
   constructor(db, credentials) {
@@ -44,6 +45,12 @@ class PublishingSchedulingAgent {
 
   async scheduleContent(productionData) {
     try {
+      if (!await this.isProductionApprovedForScheduling(productionData)) {
+        const error = new Error('Content must pass review and be explicitly approved before scheduling');
+        error.status = 409;
+        error.code = 'APPROVAL_REQUIRED';
+        throw error;
+      }
       const finalVideo = productionData.assets?.finalVideo;
       if (!finalVideo || finalVideo.simulated || path.extname(finalVideo.path || '').toLowerCase() !== '.mp4') {
         this.logger.warn(`Not scheduling ${productionData.id}: no real video file was produced (placeholder/simulated output). Fix your AI provider keys and FFmpeg, then regenerate.`);
@@ -98,30 +105,105 @@ class PublishingSchedulingAgent {
     }
   }
 
+  async isProductionApprovedForScheduling(productionData) {
+    if (productionData.explicitApproval === true) return true;
+    if (productionData.reviewStatus === 'approved' || productionData.review_status === 'approved') return true;
+
+    if (productionData.shortClipId && this.db.getShortClip) {
+      const clip = await this.db.getShortClip(productionData.shortClipId);
+      if (clip?.approvedAt && clip.status !== 'rejected') return true;
+    }
+
+    if (productionData.id && this.db.getProductionBundle) {
+      const bundle = await this.db.getProductionBundle(productionData.id);
+      if (bundle?.review_status === 'approved') return true;
+    }
+
+    return false;
+  }
+
+  async assertPublishingSafety(contentId, scheduleEntry = null) {
+    if (this.db.getLatestReadinessRun) {
+      const readiness = await this.db.getLatestReadinessRun();
+      if (readiness?.status === 'failed') {
+        const failures = readiness.checks
+          .filter(check => check.blocking && check.status === 'failed')
+          .map(check => check.id);
+        const error = new Error(`Publishing is blocked by the production readiness gate. Fix ${failures.join(', ')} and run the check again.`);
+        error.status = 409;
+        error.code = 'READINESS_BLOCKED';
+        throw error;
+      }
+    }
+
+    const metadata = scheduleEntry?.metadata || {};
+    const shortClipId = metadata.shortClipId || null;
+    let shortClip = null;
+    if (shortClipId && this.db.getShortClip) {
+      shortClip = await this.db.getShortClip(shortClipId);
+    } else if (this.db.getShortClip) {
+      shortClip = await this.db.getShortClip(contentId);
+    }
+
+    let productionBundle = null;
+    if (this.db.getProductionBundle) {
+      const sourceId = shortClip?.productionId || metadata.sourceProductionId || contentId;
+      productionBundle = await this.db.getProductionBundle(sourceId);
+    }
+
+    if (shortClip) {
+      if (!shortClip.approvedAt ||
+          !['scheduled', 'uploading', 'reconciliation_required', 'published'].includes(shortClip.status)) {
+        const error = new Error('Short must be explicitly approved before publishing');
+        error.status = 409;
+        error.code = 'APPROVAL_REQUIRED';
+        throw error;
+      }
+      if (!productionBundle || productionBundle.review_status !== 'approved') {
+        const error = new Error('The source production must be explicitly approved before publishing this Short');
+        error.status = 409;
+        error.code = 'SHORT_SOURCE_APPROVAL_REQUIRED';
+        throw error;
+      }
+    } else if (!productionBundle || productionBundle.review_status !== 'approved') {
+      const error = new Error('Content must pass review and be explicitly approved before publishing');
+      error.status = 409;
+      error.code = 'APPROVAL_REQUIRED';
+      throw error;
+    }
+
+    if (productionBundle &&
+        !['verified', 'not_required'].includes(productionBundle.provenance?.status || 'not_required')) {
+      const error = new Error('Publishing is blocked until every factual claim is supported or explicitly waived');
+      error.status = 409;
+      error.code = 'PROVENANCE_BLOCKED';
+      throw error;
+    }
+
+    const finalVideo = metadata.video || productionBundle?.assets?.finalVideo;
+    if (!finalVideo ||
+        finalVideo.simulated ||
+        path.extname(finalVideo.path || '').toLowerCase() !== '.mp4') {
+      const error = new Error('A real MP4 is required before content can be published');
+      error.status = 409;
+      error.code = 'REAL_MP4_REQUIRED';
+      throw error;
+    }
+    await this.validateMP4Container(finalVideo.path);
+
+    const audio = metadata.audio || productionBundle?.assets?.audio;
+    if (!await this.isNarrationReady(audio)) {
+      const error = new Error('Publishing is blocked because narration is missing or the intentional-silence override is incomplete');
+      error.status = 409;
+      error.code = 'NARRATION_REQUIRED';
+      throw error;
+    }
+
+    return { productionBundle, shortClip };
+  }
+
   async publishContent(contentId, options = {}) {
     try {
-      let productionBundle = null;
-      if (this.db.getLatestReadinessRun) {
-        const readiness = await this.db.getLatestReadinessRun();
-        if (readiness?.status === 'failed') {
-          const failures = readiness.checks
-            .filter(check => check.blocking && check.status === 'failed')
-            .map(check => check.id);
-          const error = new Error(`Publishing is blocked by the production readiness gate. Fix ${failures.join(', ')} and run the check again.`);
-          error.status = 409;
-          error.code = 'READINESS_BLOCKED';
-          throw error;
-        }
-      }
-      if (this.db.getProductionBundle) {
-        productionBundle = await this.db.getProductionBundle(contentId);
-        if (productionBundle && !['verified', 'not_required'].includes(productionBundle.provenance?.status || 'not_required')) {
-          const error = new Error('Publishing is blocked until every factual claim is supported or explicitly waived');
-          error.status = 409;
-          error.code = 'PROVENANCE_BLOCKED';
-          throw error;
-        }
-      }
       this.logger.info(`Publishing content: ${contentId}`);
       
       let scheduleEntry = this.publishQueue.find(entry =>
@@ -134,13 +216,8 @@ class PublishingSchedulingAgent {
       if (!scheduleEntry) {
         throw new Error(`Content not found in queue: ${contentId}`);
       }
+      await this.assertPublishingSafety(contentId, scheduleEntry);
       if (scheduleEntry.status === 'published') return scheduleEntry;
-      if (!await this.isNarrationReady(scheduleEntry.metadata?.audio || productionBundle?.assets?.audio)) {
-        const error = new Error('Publishing is blocked because narration is missing or the intentional-silence override is incomplete');
-        error.status = 409;
-        error.code = 'NARRATION_REQUIRED';
-        throw error;
-      }
       if (scheduleEntry.youtubeId) {
         return this.reconcileUploadedVideo(scheduleEntry);
       }
@@ -197,6 +274,8 @@ class PublishingSchedulingAgent {
   }
 
   async uploadToYouTube(scheduleEntry, options = {}) {
+    const contentId = scheduleEntry.metadata?.shortClipId || scheduleEntry.productionId || scheduleEntry.id;
+    await this.assertPublishingSafety(contentId, scheduleEntry);
     const { metadata } = scheduleEntry;
     const validation = assertValidYouTubeMetadata(metadata.seo);
     if (validation.warnings.length) {
@@ -257,7 +336,53 @@ class PublishingSchedulingAgent {
     return videoUpload.data;
   }
 
+  async validateMP4Container(videoPath) {
+    if (!videoPath || path.extname(videoPath).toLowerCase() !== '.mp4') {
+      const error = new Error('A real MP4 container is required before publishing');
+      error.status = 409;
+      error.code = 'REAL_MP4_REQUIRED';
+      throw error;
+    }
+
+    let handle;
+    try {
+      const stats = await fs.stat(videoPath);
+      if (!stats.isFile() || stats.size < 12) throw new Error('missing or truncated');
+
+      handle = await fs.open(videoPath, 'r');
+      const header = Buffer.alloc(12);
+      const { bytesRead } = await handle.read(header, 0, header.length, 0);
+      if (bytesRead !== header.length || header.toString('ascii', 4, 8) !== 'ftyp') {
+        throw new Error('invalid MP4 signature');
+      }
+    } catch (_error) {
+      const error = new Error('The MP4 file is missing or is not a valid MP4 container');
+      error.status = 409;
+      error.code = 'REAL_MP4_REQUIRED';
+      throw error;
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+    }
+
+    try {
+      await runFFmpeg([
+        '-v', 'error',
+        '-i', videoPath,
+        '-map', '0:v:0',
+        '-frames:v', '1',
+        '-f', 'null',
+        '-'
+      ]);
+    } catch (_error) {
+      const error = new Error('The MP4 file cannot be decoded as a valid media container');
+      error.status = 409;
+      error.code = 'REAL_MP4_REQUIRED';
+      throw error;
+    }
+  }
+
   async isNarrationReady(audio = {}) {
+    if (!audio) return false;
     if (audio.intentionalSilence === true) {
       return String(audio.silenceReason || '').trim().length >= 10 && Boolean(audio.silenceConfirmedAt);
     }
@@ -636,6 +761,7 @@ class PublishingSchedulingAgent {
       const entry = this.publishQueue.find(e => e.productionId === contentId || e.id === contentId) ||
         await this.db.getLatestScheduleEntry?.(contentId);
       if (!entry) throw new Error(`Content not found: ${contentId}`);
+      await this.assertPublishingSafety(contentId, entry);
       const newPublishTime = new Date(Date.now() + (delayMinutes * 60 * 1000));
       entry.publishTime = newPublishTime.toISOString();
       await this.db.updateScheduleEntry(entry);

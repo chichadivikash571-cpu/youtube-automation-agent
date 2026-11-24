@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const fs = require('fs').promises;
+const crypto = require('crypto');
 const { Logger } = require('./utils/logger');
 const { Database } = require('./database/db');
 const { CredentialManager } = require('./utils/credential-manager');
@@ -31,7 +32,8 @@ const { version } = require('./package.json');
 const chalk = require('chalk');
 
 function isLoopbackHost(host) {
-  return ['127.0.0.1', '::1', 'localhost'].includes(String(host).toLowerCase()) || /^127\./.test(String(host));
+  const normalizedHost = String(host).trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return ['127.0.0.1', '::1', 'localhost'].includes(normalizedHost) || /^127\./.test(normalizedHost);
 }
 
 class YouTubeAutomationAgent {
@@ -41,6 +43,8 @@ class YouTubeAutomationAgent {
     this.credentials = null;
     this.agents = {};
     this.app = express();
+    this.apiRateLimits = new Map();
+    this.apiRateLimitLastSweep = 0;
     this.isInitialized = false;
     this.activeJobs = new Map();
     this.operator = null;
@@ -218,16 +222,102 @@ class YouTubeAutomationAgent {
 
   requireAPIKey() {
     return (req, res, next) => {
-      if (!process.env.API_KEY) {
+      const expectedKey = String(process.env.API_KEY || '').trim();
+      if (!expectedKey) {
+        if (!isLoopbackHost(process.env.HOST || '127.0.0.1')) {
+          return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
         return next();
       }
 
-      if (req.get('x-api-key') !== process.env.API_KEY) {
+      const providedKey = String(req.get('x-api-key') || '').trim();
+      const expected = Buffer.from(expectedKey);
+      const provided = Buffer.from(providedKey);
+      if (expected.length !== provided.length || !crypto.timingSafeEqual(expected, provided)) {
         return res.status(401).json({ success: false, error: 'Unauthorized' });
       }
 
       return next();
     };
+  }
+
+  assertNetworkAuthenticationConfigured(host, apiKey) {
+    if (!isLoopbackHost(host) && !String(apiKey || '').trim()) {
+      throw new Error('API_KEY must be configured before listening on a non-loopback interface');
+    }
+  }
+
+  isAPIRequestPath(requestPath) {
+    const normalizedPath = requestPath.toLowerCase();
+    return normalizedPath === '/api' ||
+      normalizedPath.startsWith('/api/') ||
+      ['/generate', '/analytics', '/schedule', '/publish'].includes(normalizedPath) ||
+      normalizedPath.startsWith('/publish/');
+  }
+
+  isSameOriginMutation(req) {
+    if (req.get('sec-fetch-site') === 'cross-site') return false;
+    const origin = req.get('origin');
+    if (!origin) return true;
+    if (origin === 'null') return false;
+
+    try {
+      const parsedOrigin = new URL(origin);
+      const requestHost = req.get('host');
+      return ['http:', 'https:'].includes(parsedOrigin.protocol) &&
+        !parsedOrigin.username &&
+        !parsedOrigin.password &&
+        Boolean(requestHost) &&
+        parsedOrigin.host.toLowerCase() === requestHost.toLowerCase();
+    } catch {
+      return false;
+    }
+  }
+
+  enforceAPIRateLimit(req, res, next) {
+    const now = Date.now();
+    const windowMs = 60 * 1000;
+    const limit = ['GET', 'HEAD'].includes(req.method) ? 120 : 30;
+    const client = req.ip || req.socket.remoteAddress || 'unknown';
+    const existing = this.apiRateLimits.get(client);
+
+    if (this.apiRateLimitLastSweep < now - windowMs) {
+      for (const [key, bucket] of this.apiRateLimits) {
+        if (bucket.windowStartedAt <= now - windowMs) this.apiRateLimits.delete(key);
+      }
+      this.apiRateLimitLastSweep = now;
+    }
+
+    let bucket = this.apiRateLimits.get(client);
+    if (!bucket || bucket.windowStartedAt <= now - windowMs) {
+      if (!existing && this.apiRateLimits.size >= 10000) {
+        return res.status(429).json({ success: false, error: 'Too many requests' });
+      }
+      bucket = { windowStartedAt: now, reads: 0, writes: 0 };
+      this.apiRateLimits.set(client, bucket);
+    }
+
+    const counter = ['GET', 'HEAD'].includes(req.method) ? 'reads' : 'writes';
+    if (bucket[counter] >= limit) {
+      res.set('Retry-After', String(Math.ceil((bucket.windowStartedAt + windowMs - now) / 1000)));
+      return res.status(429).json({ success: false, error: 'Too many requests' });
+    }
+
+    bucket[counter] += 1;
+    return next();
+  }
+
+  applyAPISecurity(req, res, next) {
+    if (!this.isAPIRequestPath(req.path)) return next();
+
+    return this.enforceAPIRateLimit(req, res, () => {
+      this.requireAPIKey()(req, res, () => {
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && !this.isSameOriginMutation(req)) {
+          return res.status(403).json({ success: false, error: 'Request origin is not allowed' });
+        }
+        return next();
+      });
+    });
   }
 
   validateGenerateRequestBody(body = {}) {
@@ -377,11 +467,24 @@ class YouTubeAutomationAgent {
     };
   }
   setupAPI() {
+    this.app.disable('x-powered-by');
+    this.app.use((req, res, next) => {
+      res.set({
+        'Content-Security-Policy': "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'",
+        'Referrer-Policy': 'no-referrer',
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+        'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'
+      });
+      if (this.isAPIRequestPath(req.path)) res.set('Cache-Control', 'no-store');
+      return next();
+    });
     this.app.use(express.json({ limit: '1mb' }));
+    this.app.use((req, res, next) => this.applyAPISecurity(req, res, next));
     this.app.use(express.static(path.join(__dirname, 'dashboard')));
 
-    if (!process.env.API_KEY) {
-      this.logger.warn('API_KEY is not set; mutating API routes are unprotected');
+    if (!String(process.env.API_KEY || '').trim() && isLoopbackHost(process.env.HOST || '127.0.0.1')) {
+      this.logger.info('API_KEY is not set; API access is limited to loopback by HOST configuration');
     }
     
     // Main dashboard route
@@ -484,6 +587,24 @@ class YouTubeAutomationAgent {
     });
 
     this.setupOperatorAPI();
+    this.app.use((error, req, res, next) => {
+      if (res.headersSent) return next(error);
+      if (error.type === 'entity.too.large') {
+        return res.status(413).json({ success: false, error: 'Request body is too large' });
+      }
+      if (error.type === 'entity.parse.failed') {
+        return res.status(400).json({ success: false, error: 'Invalid JSON request body' });
+      }
+      this.logger.error('Unhandled request error', {
+        name: error.name,
+        type: error.type,
+        status: error.status,
+        method: req.method,
+        path: req.path
+      });
+      return res.status(Number.isInteger(error.status) && error.status >= 400 && error.status < 500 ? error.status : 500)
+        .json({ success: false, error: 'Request could not be processed' });
+    });
   }
 
   setupOperatorAPI() {
@@ -1842,6 +1963,10 @@ class YouTubeAutomationAgent {
   }
 
   async start() {
+    const PORT = process.env.PORT || 3456;
+    const HOST = process.env.HOST || '127.0.0.1';
+    this.assertNetworkAuthenticationConfigured(HOST, process.env.API_KEY);
+
     const initialized = await this.initialize();
     
     if (!initialized) {
@@ -1849,15 +1974,8 @@ class YouTubeAutomationAgent {
       process.exit(1);
     }
     
-    const PORT = process.env.PORT || 3456;
-    // Loopback by default: mutating routes are open whenever API_KEY is unset,
-    // so the dashboard must not be reachable from the network unless asked.
-    const HOST = process.env.HOST || '127.0.0.1';
     this.app.listen(PORT, HOST, () => {
       console.log(chalk.green(`\n✅ YouTube Automation Agent running on ${HOST}:${PORT}`));
-      if (!isLoopbackHost(HOST) && !process.env.API_KEY) {
-        console.log(chalk.yellow(`⚠️  HOST=${HOST} exposes the dashboard to your network without API_KEY. Set API_KEY in .env to protect generation, approval, and publishing routes.`));
-      }
       console.log(chalk.gray('─'.repeat(50)));
       console.log(chalk.white('📊 Dashboard: ') + chalk.cyan(`http://localhost:${PORT}`));
       console.log(chalk.white('🔧 API Health: ') + chalk.cyan(`http://localhost:${PORT}/health`));

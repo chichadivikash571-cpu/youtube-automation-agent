@@ -6,7 +6,7 @@ It researches topics, writes scripts, generates narration and visuals, assembles
 
 [![CI](https://github.com/darkzOGx/youtube-automation-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/darkzOGx/youtube-automation-agent/actions/workflows/ci.yml)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Node.js 18.17+](https://img.shields.io/badge/node-18.17%2B-43853d.svg)](package.json)
+[![Node.js 20.17+](https://img.shields.io/badge/node-20.17%2B-43853d.svg)](package.json)
 [![Releases](https://img.shields.io/github/v/release/darkzOGx/youtube-automation-agent?label=release)](https://github.com/darkzOGx/youtube-automation-agent/releases)
 
 ![The operator console: videos waiting for your decision, a generation job in progress, and the publishing calendar](assets/screenshots/overview.png)
@@ -16,6 +16,7 @@ It researches topics, writes scripts, generates narration and visuals, assembles
 | Content review: quality checks and approval for one video | Autonomous operator: your mandate and the agent's plan |
 
 *Screenshots use sample data so every panel is populated. Regenerate them with `npm run docs:screenshots`.*
+Playwright browser binaries are installed separately; run `npx playwright install chromium` once before regenerating screenshots.
 
 ## Why it's different
 
@@ -29,7 +30,7 @@ It researches topics, writes scripts, generates narration and visuals, assembles
 
 You need:
 
-- Node.js 18.17 or newer
+- Node.js 20.17 or newer (Node 22 or 24 recommended)
 - A Google account and YouTube Data API credentials ([setup steps](#youtube-credentials))
 - An API key for at least one [text provider](docs/providers.md#text). Gemini has free tiers for text and narration.
 
